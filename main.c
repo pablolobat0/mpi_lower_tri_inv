@@ -35,10 +35,13 @@ int free_2d_double(double ***array) {
   return 0;
 }
 
-void inicializar_matriz(double **matriz, int tamano) {
+void inicializar_matriz(double **matriz, int tamano, double *diagonal) {
   for (int i = 0; i < tamano; i++) {
     for (int j = 0; j < tamano; j++) {
       matriz[i][j] = (i >= j) ? (double)(rand() % 10 + 1) : 0.0;
+      if (i == j) {
+        diagonal[i] = matriz[i][j];
+      }
     }
   }
 }
@@ -56,6 +59,7 @@ int main(int argc, char *argv[]) {
   int rank, size, N, C;
   double **A = NULL;
   double **local_A = NULL;
+  double **local_A_inv = NULL;
 
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -72,15 +76,28 @@ int main(int argc, char *argv[]) {
   N = atoi(argv[1]);
   // Tamano de los bloques de columnas
   C = atoi(argv[2]);
+  double *diagonal = (double *)malloc(N * sizeof(double));
 
   // Solo el proceso 0 inicializa la matriz completa
   if (rank == 0) {
     malloc_2d_double(&A, N, N);
-    inicializar_matriz(A, N);
+    inicializar_matriz(A, N, diagonal);
+    printf("Matriz inicial:\n");
     imprimir_matriz(A, N, N);
   }
 
+  // Distribucion de la diagonal de la matriz
+  MPI_Bcast(diagonal, N, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+
   malloc_2d_double(&local_A, N, C);
+  malloc_2d_double(&local_A_inv, N, C);
+
+  // Inicilizar la matriz inversa local
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j < C; j++) {
+      local_A_inv[i][j] = 0.0;
+    }
+  }
 
   /* create a datatype to describe the subarrays of the global array */
 
@@ -115,12 +132,44 @@ int main(int argc, char *argv[]) {
     }
     MPI_Barrier(MPI_COMM_WORLD);
   }
-  if (rank == 0)
+
+  for (int i = 0; i < N; i++) {
+    if (rank == i / C) {
+      int local_col = i % C;
+      // Calcular el elemento de la diagonal
+      local_A_inv[i][local_col] = 1.0 / local_A[i][local_col];
+    }
+  }
+
+  // Calcular los elementos por debajo de la diagonal
+  // ADAPTAR A INDICES LOCALES EL PROBLEMA ESTA EN LA SEGUNDA MATRIZ
+  // El problema es que necesita un elemento de la fila que tiene otro proceso
+  for (int i = 1; i < N; i++) {
+    for (int j = 0; j < C; j++) {
+      if (i > (j * rank)) {
+        for (int k = j; k < i; k++) {
+          local_A_inv[i][j] += local_A[i][k] * local_A_inv[k][j];
+        }
+        local_A_inv[i][j] /= -diagonal[i];
+      }
+    }
+  }
+
+  /* it all goes back to process 0 */
+  MPI_Gatherv(&(local_A_inv[0][0]), C * N, MPI_DOUBLE,
+              (rank == ROOT ? &(A[0][0]) : NULL), counts, displs, resizedtype,
+              ROOT, MPI_COMM_WORLD);
+
+  if (rank == ROOT) {
+    printf("Matriz inversa:\n");
+    imprimir_matriz(A, N, N);
     free_2d_double(&A);
+  }
 
   free_2d_double(&local_A);
   free(counts);
   free(displs);
+  free(diagonal);
 
   MPI_Type_free(&resizedtype);
   MPI_Type_free(&type);
