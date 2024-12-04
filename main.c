@@ -35,13 +35,10 @@ int free_2d_double(double ***array) {
   return 0;
 }
 
-void inicializar_matriz(double **matriz, int tamano, double *diagonal) {
+void inicializar_matriz(double **matriz, int tamano) {
   for (int i = 0; i < tamano; i++) {
     for (int j = 0; j < tamano; j++) {
       matriz[i][j] = (i >= j) ? (double)(rand() % 10 + 1) : 0.0;
-      if (i == j) {
-        diagonal[i] = matriz[i][j];
-      }
     }
   }
 }
@@ -49,7 +46,7 @@ void inicializar_matriz(double **matriz, int tamano, double *diagonal) {
 void imprimir_matriz(double **matriz, int filas, int columnas) {
   for (int i = 0; i < filas; i++) {
     for (int j = 0; j < columnas; j++) {
-      printf("%8.3f ", matriz[i][j]);
+      printf("%8.5f ", matriz[i][j]);
     }
     printf("\n");
   }
@@ -76,18 +73,14 @@ int main(int argc, char *argv[]) {
   N = atoi(argv[1]);
   // Tamano de los bloques de columnas
   C = atoi(argv[2]);
-  double *diagonal = (double *)malloc(N * sizeof(double));
 
   // Solo el proceso 0 inicializa la matriz completa
   if (rank == 0) {
     malloc_2d_double(&A, N, N);
-    inicializar_matriz(A, N, diagonal);
+    inicializar_matriz(A, N);
     printf("Matriz inicial:\n");
     imprimir_matriz(A, N, N);
   }
-
-  // Distribucion de la diagonal de la matriz
-  MPI_Bcast(diagonal, N, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
 
   malloc_2d_double(&local_A, N, C);
   malloc_2d_double(&local_A_inv, N, C);
@@ -141,16 +134,26 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  double *fila = (double *)malloc(N * sizeof(double));
+
   // Calcular los elementos por debajo de la diagonal
-  // ADAPTAR A INDICES LOCALES EL PROBLEMA ESTA EN LA SEGUNDA MATRIZ
-  // El problema es que necesita un elemento de la fila que tiene otro proceso
   for (int i = 1; i < N; i++) {
+    // Root rellena la fila en la que van a trabajar los procesos
+    if (rank == ROOT) {
+      for (int a = 0; a < N; a++) {
+        fila[a] = A[i][a];
+      }
+    }
+
+    MPI_Bcast(fila, N, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+
+    // Iteramos por los distintos elementos de esa fila
     for (int j = 0; j < C; j++) {
-      if (i > (j * rank)) {
-        for (int k = j; k < i; k++) {
-          local_A_inv[i][j] += local_A[i][k] * local_A_inv[k][j];
+      if (i > (j + C * rank)) {
+        for (int k = 0; k < i; k++) {
+          local_A_inv[i][j] += fila[k] * local_A_inv[k][j];
         }
-        local_A_inv[i][j] /= -diagonal[i];
+        local_A_inv[i][j] /= -fila[i];
       }
     }
   }
@@ -169,7 +172,7 @@ int main(int argc, char *argv[]) {
   free_2d_double(&local_A);
   free(counts);
   free(displs);
-  free(diagonal);
+  free(fila);
 
   MPI_Type_free(&resizedtype);
   MPI_Type_free(&type);
