@@ -1,4 +1,4 @@
-#include "/usr/include/mpi.h"
+#include "/usr/lib/x86_64-linux-gnu/openmpi/include/mpi.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -83,61 +83,48 @@ int main(int argc, char *argv[]) {
     imprimir_matriz(A, N, N);
   }
 
-  if (malloc_2d_double(&local_A, N, C) == -1) {
+  // Reservar memoria dinámica para las submatrices locales
+  if (malloc_2d_double(&local_A, N, N / size) == -1) {
     exit(EXIT_FAILURE);
   }
 
-  if (malloc_2d_double(&local_A_inv, N, C) == -1) {
+  if (malloc_2d_double(&local_A_inv, N, N / size) == -1) {
     exit(EXIT_FAILURE);
   }
 
-  // Inicilizar la matriz inversa local a 0
+  // Inicializacion de la matriz inversa local a 0
   for (int i = 0; i < N; i++) {
-    for (int j = 0; j < C; j++) {
+    for (int j = 0; j < N / size; j++) {
       local_A_inv[i][j] = 0.0;
     }
   }
 
-  // Creacion de un tipo de dato para describir las submatrices de la matriz
-  // global Tamano de la matriz
-  int sizes[2] = {N, N};
-  // Tamano de la submatriz
-  int subsizes[2] = {N, C};
-  // Donde empiezan las submatrices
-  int starts[2] = {0, 0};
-  MPI_Datatype type, resizedtype;
-  MPI_Type_create_subarray(2, sizes, subsizes, starts, MPI_ORDER_C, MPI_DOUBLE,
-                           &type);
-  MPI_Type_create_resized(type, 0, C * sizeof(double), &resizedtype);
-  MPI_Type_commit(&resizedtype);
+  // Crear un tipo derivado para un bloque de columnas
+  MPI_Datatype block, block_type;
+  MPI_Type_vector(N, 1, N, MPI_DOUBLE, &block);
+  MPI_Type_commit(&block);
+  MPI_Type_create_resized(block, 0, 1 * sizeof(double), &block_type);
+  MPI_Type_commit(&block_type);
 
-  // Configurar `counts` y `displs` para MPI_Scatterv
-  int *counts = malloc(size * sizeof(int));
-  int *displs = malloc(size * sizeof(int));
+  int x = 0;
+  for (int a = 0; a <= N; a += size) {
+    double *recv_buffer = (double *)malloc(N * sizeof(double));
+    MPI_Scatter((rank == ROOT ? &(A[0][a]) : NULL), 1, block_type, recv_buffer,
+                N, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
 
-  if (rank == 0) {
-    for (int i = 0; i < size; i++) {
-      // Cada proceso recibe un bloque
-      counts[i] = 1;
-      // Saltos entre bloques
-      displs[i] = i;
+    for (int j = 0; j < N; j++) {
+      local_A[j][x] = recv_buffer[j];
     }
+    x++;
   }
-
-  MPI_Scatterv((rank == ROOT ? &(A[0][0]) : NULL), counts, displs, resizedtype,
-               &(local_A[0][0]), N * C, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
-
   // Se imprimen las submatrices
   for (int i = 0; i < size; i++) {
     if (rank == i) {
       printf("Submatriz local en el proceso %d:\n", rank);
-      imprimir_matriz(local_A, N, C);
+      imprimir_matriz(local_A, N, N / size);
       printf("\n");
     }
     MPI_Barrier(MPI_COMM_WORLD);
-  }
-
-  for (int i = 0; i < N; i++) {
   }
 
   double *fila = (double *)malloc(N * sizeof(double));
@@ -145,9 +132,9 @@ int main(int argc, char *argv[]) {
   // Calcular los elementos por debajo de la diagonal
   for (int i = 0; i < N; i++) {
     // Calcular el elemento de la diagonal
-    int diagonal_owner = i / C;
+    int diagonal_owner = i % size;
     if (rank == diagonal_owner) {
-      int local_col = i % C;
+      int local_col = i / size;
       local_A_inv[i][local_col] = 1.0 / local_A[i][local_col];
     }
 
@@ -161,21 +148,48 @@ int main(int argc, char *argv[]) {
     MPI_Bcast(fila, N, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
 
     // Calculo de la inversa para cada elemento de la fila
-    for (int j = 0; j < C; j++) {
-      if (i > (j + C * rank)) {
-        for (int k = 0; k < i; k++) {
-          local_A_inv[i][j] += fila[k] * local_A_inv[k][j];
+    for (int j = 0; j < N; j++) {
+      int element_owner = j % size;
+      if (rank == element_owner) {
+        if (i > j) {
+          int local_column = j / size;
+          for (int k = j; k < i; k++) {
+            local_A_inv[i][local_column] +=
+                fila[k] * local_A_inv[k][local_column];
+          }
+          local_A_inv[i][local_column] /= -fila[i];
         }
-        local_A_inv[i][j] /= -fila[i];
       }
     }
   }
 
-  // Se devuelven las submatrices inversas calculadas al proceso root
-  MPI_Gatherv(&(local_A_inv[0][0]), C * N, MPI_DOUBLE,
-              (rank == ROOT ? &(A[0][0]) : NULL), counts, displs, resizedtype,
-              ROOT, MPI_COMM_WORLD);
+  MPI_Datatype column, column_type;
+  MPI_Type_vector(N, 1, N / size, MPI_DOUBLE, &column);
+  MPI_Type_commit(&column);
+  MPI_Type_create_resized(column, 0, 1 * sizeof(double), &column_type);
+  MPI_Type_commit(&column_type);
 
+  x = 0;
+  for (int a = 0; a < N / size; a++) {
+    double *recv_buffer = NULL;
+    if (rank == ROOT) {
+      recv_buffer = (double *)malloc(N * size * sizeof(double));
+    }
+
+    // Se devuelven las submatrices inversas calculadas al proceso root
+    MPI_Gather(&(local_A_inv[0][a]), 1, column_type,
+               (rank == ROOT ? recv_buffer : NULL), N, MPI_DOUBLE, ROOT,
+               MPI_COMM_WORLD);
+    if (rank == ROOT) {
+      for (int j = 0; j < size; j++) { // Procesos
+        for (int i = 0; i < N; i++) {  // Filas
+          A[i][x + j] = recv_buffer[j * N + i];
+        }
+      }
+      free(recv_buffer);
+    }
+    x += size;
+  }
   // Impresion de la matriz inversa
   if (rank == ROOT) {
     printf("Matriz inversa:\n");
@@ -184,12 +198,10 @@ int main(int argc, char *argv[]) {
   }
 
   free_2d_double(&local_A);
-  free(counts);
-  free(displs);
+  free_2d_double(&local_A_inv);
   free(fila);
 
-  MPI_Type_free(&resizedtype);
-  MPI_Type_free(&type);
+  MPI_Type_free(&block_type);
 
   MPI_Finalize();
   return 0;
