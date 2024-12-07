@@ -55,9 +55,64 @@ void imprimir_matriz(double **matriz, int filas, int columnas) {
   }
 }
 
+/*
+ * La matriz triangular inferior es una matriz en la que todos los elementos por
+ * encima de la diagonal principal son iguales a cero. Dada una matriz
+ * triangular inferior L, su inversa L^-1 también es una matriz triangular
+ * inferior. El cálculo de la inversa se realiza utilizando un procedimiento
+ * iterativo basado en la siguiente fórmula:
+ *
+ * Para cada elemento L[i,j]^-1:
+ *
+ * 1. Si i == j (elemento diagonal), entonces:
+ *  L[i, j]^-1 = 1 / L[i, j]
+ *
+ * 2. Si i > j (elemento debajo de la diagonal), entonces:
+ *  L[i, j]^-1 = -1 / L[i, i] * (Sumatorio{k=j,k < i, k++} L[i, k] * L[k, j]^-1)
+ */
+void calcular_matriz_inversa(int N, int rank, int size, double **A,
+                             double **local_A, double **local_A_inv) {
+  // Calculo de la matriz inversa
+  for (int row = 0; row < N; row++) {
+    // Calcular el elemento de la diagonal
+    int diagonal_owner = row % size;
+    if (rank == diagonal_owner) {
+      int local_col = row / size;
+      local_A_inv[row][local_col] = 1.0 / local_A[row][local_col];
+    }
+
+    double *current_row = (double *)malloc(N * sizeof(double));
+    // Root difunde la fila actual a todos los procesos
+    if (rank == ROOT) {
+      for (int a = 0; a < N; a++) {
+        current_row[a] = A[row][a];
+      }
+    }
+
+    MPI_Bcast(current_row, N, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
+
+    // Calculo de los elementos que estan debajo de la diagonal
+    for (int col = 0; col < N; col++) {
+      int element_owner = col % size;
+      if (rank == element_owner) {
+        if (row > col) {
+          int local_column = col / size;
+          for (int k = col; k < row; k++) {
+            local_A_inv[row][local_column] +=
+                current_row[k] * local_A_inv[k][local_column];
+          }
+          local_A_inv[row][local_column] /= -current_row[row];
+        }
+      }
+    }
+    free(current_row);
+  }
+}
+
 int main(int argc, char *argv[]) {
   int rank, size, N, C;
   double **A = NULL;
+  double **A_inv = NULL;
   double **local_A = NULL;
   double **local_A_inv = NULL;
 
@@ -82,6 +137,11 @@ int main(int argc, char *argv[]) {
     if (malloc_2d_double(&A, N, N) == -1) {
       exit(EXIT_FAILURE);
     }
+
+    if (malloc_2d_double(&A_inv, N, N) == -1) {
+      exit(EXIT_FAILURE);
+    }
+
     inicializar_matriz_triangular_inferior(A, N);
     printf("Matriz inicial:\n");
     imprimir_matriz(A, N, N);
@@ -115,7 +175,7 @@ int main(int argc, char *argv[]) {
 
   // Reparto de la matriz por columnas entre los procesos
   int recv_column = 0;
-  for (int send_column = 0; send_column <= N; send_column += size) {
+  for (int send_column = 0; send_column < N; send_column += size) {
     double *recv_buffer = (double *)malloc(N * sizeof(double));
     MPI_Scatter((rank == ROOT ? &(A[0][send_column]) : NULL), 1, block_type,
                 recv_buffer, N, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
@@ -135,41 +195,7 @@ int main(int argc, char *argv[]) {
   printf("\n");
   MPI_Barrier(MPI_COMM_WORLD);
 
-  double *current_row = (double *)malloc(N * sizeof(double));
-
-  // Calculo de la matriz inversa
-  for (int row = 0; row < N; row++) {
-    // Calcular el elemento de la diagonal
-    int diagonal_owner = row % size;
-    if (rank == diagonal_owner) {
-      int local_col = row / size;
-      local_A_inv[row][local_col] = 1.0 / local_A[row][local_col];
-    }
-
-    // Root difunde la fila actual a todos los procesos
-    if (rank == ROOT) {
-      for (int a = 0; a < N; a++) {
-        current_row[a] = A[row][a];
-      }
-    }
-
-    MPI_Bcast(current_row, N, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
-
-    // Calculo de los elementos que estan debajo de la diagonal
-    for (int col = 0; col < N; col++) {
-      int element_owner = col % size;
-      if (rank == element_owner) {
-        if (row > col) {
-          int local_column = col / size;
-          for (int k = col; k < row; k++) {
-            local_A_inv[row][local_column] +=
-                current_row[k] * local_A_inv[k][local_column];
-          }
-          local_A_inv[row][local_column] /= -current_row[row];
-        }
-      }
-    }
-  }
+  calcular_matriz_inversa(N, rank, size, A, local_A, local_A_inv);
 
   // Tipo de dato para el envio de las columnas locales
   MPI_Datatype column, column_type;
@@ -197,7 +223,7 @@ int main(int argc, char *argv[]) {
       // Inserta las columnas recibidas en la matriz global
       for (int process = 0; process < size; process++) {
         for (int row = 0; row < N; row++) {
-          A[row][col_offset + process] = recv_buffer[process * N + row];
+          A_inv[row][col_offset + process] = recv_buffer[process * N + row];
         }
       }
       free(recv_buffer);
@@ -209,16 +235,18 @@ int main(int argc, char *argv[]) {
   // Impresion de la matriz inversa
   if (rank == ROOT) {
     printf("Matriz inversa:\n");
-    imprimir_matriz(A, N, N);
+    imprimir_matriz(A_inv, N, N);
     free_2d_double(&A);
+    free_2d_double(&A_inv);
   }
 
   free_2d_double(&local_A);
   free_2d_double(&local_A_inv);
-  free(current_row);
 
   MPI_Type_free(&block_type);
+  MPI_Type_free(&block);
   MPI_Type_free(&column_type);
+  MPI_Type_free(&column);
 
   MPI_Finalize();
   return 0;
