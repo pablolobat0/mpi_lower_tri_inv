@@ -53,6 +53,7 @@ void imprimir_matriz(double **matriz, int filas, int columnas) {
     }
     printf("\n");
   }
+  printf("\n");
 }
 
 /*
@@ -117,9 +118,9 @@ void calcular_matriz_inversa(int N, int C, int rank, int size, double **A,
 int main(int argc, char *argv[]) {
   int rank, size, N, C;
   double **A = NULL;
-  double **A_inv = NULL;
   double **local_A = NULL;
   double **local_A_inv = NULL;
+  MPI_Datatype block, global_block, local_block;
 
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -147,10 +148,6 @@ int main(int argc, char *argv[]) {
       MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    if (malloc_2d_double(&A_inv, N, N) == -1) {
-      MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
     inicializar_matriz_triangular_inferior(A, N);
     printf("Matriz inicial:\n");
     imprimir_matriz(A, N, N);
@@ -167,104 +164,59 @@ int main(int argc, char *argv[]) {
     MPI_Abort(MPI_COMM_WORLD, 1);
   }
 
-  // Inicializacion de la matriz inversa local a 0
   for (int i = 0; i < N; i++) {
     for (int j = 0; j < N / size; j++) {
       local_A_inv[i][j] = 0.0;
     }
   }
 
-  // Define un tipo derivado para representar los bloques de columnas
-  MPI_Datatype block, block_type;
   /* El paso entre bloques es el tamano de fila para obtener los
   elementos de las columnas, ya que no son contiguos */
   MPI_Type_vector(N, C, N, MPI_DOUBLE, &block);
   MPI_Type_commit(&block);
-  // "Ocupa" 1 double para que el scatter envie la siguiente columna
-  MPI_Type_create_resized(block, 0, C * sizeof(double), &block_type);
-  MPI_Type_commit(&block_type);
+  // "Ocupa" C doubles para que el scatter envie el siguiente bloque
+  MPI_Type_create_resized(block, 0, C * sizeof(double), &global_block);
+  MPI_Type_commit(&global_block);
+
+  MPI_Type_vector(N, C, bloques_por_proceso * C, MPI_DOUBLE, &local_block);
+  MPI_Type_commit(&local_block);
 
   // Reparto de la matriz por columnas entre los procesos
   int recv_offset = 0;
   for (int send_column = 0; send_column < N; send_column += size * C) {
-    double *recv_buffer = (double *)malloc(N * C * sizeof(double));
-    MPI_Scatter((rank == ROOT ? &(A[0][send_column]) : NULL), 1, block_type,
-                recv_buffer, N * C, MPI_DOUBLE, ROOT, MPI_COMM_WORLD);
-
-    // Se copian los datos en la columna correspondiente de la matriz local
-    for (int col = 0; col < C; col++) {
-      for (int row = 0; row < N; row++) {
-        local_A[row][col + recv_offset] = recv_buffer[col + C * row];
-      }
-    }
-    // Avanza a la siguiente columna local
+    MPI_Scatter((rank == ROOT ? &(A[0][send_column]) : NULL), 1, global_block,
+                &(local_A[0][recv_offset]), 1, local_block, ROOT,
+                MPI_COMM_WORLD);
+    // Aumenta el offset para apuntar a la posicion del siguiente bloque
     recv_offset += C;
-    free(recv_buffer);
-  }
-
-  // Se imprimen las submatrices
-  for (int i = 0; i < size; i++) {
-    if (rank == i) {
-      printf("Submatriz local en el proceso %d:\n", rank);
-      imprimir_matriz(local_A, N, bloques_por_proceso * C);
-      printf("\n");
-    }
-    MPI_Barrier(MPI_COMM_WORLD);
   }
 
   calcular_matriz_inversa(N, C, rank, size, A, local_A, local_A_inv);
 
-  // Tipo de dato para el envio de las columnas locales
-  MPI_Datatype column;
-  /* El paso entre bloques es el tamano de fila para obtener los
-  elementos de las columnas, ya que no son contiguos */
-  MPI_Type_vector(N, C, bloques_por_proceso * C, MPI_DOUBLE, &column);
-  MPI_Type_commit(&column);
-
   int col_offset = 0;
   for (int send_block = 0; send_block < bloques_por_proceso; send_block++) {
-    double *recv_buffer = NULL;
-    if (rank == ROOT) {
-      recv_buffer = (double *)malloc(N * C * size * sizeof(double));
-    }
-
     // Se devuelven las submatrices inversas calculadas al proceso root
-    MPI_Gather(&(local_A[0][send_block * C]), 1, column,
-               (rank == ROOT ? recv_buffer : NULL), N * C, MPI_DOUBLE, ROOT,
-               MPI_COMM_WORLD);
+    MPI_Gather(&(local_A_inv[0][send_block * C]), 1, local_block,
+               (rank == ROOT ? &(A[0][col_offset]) : NULL), 1, global_block,
+               ROOT, MPI_COMM_WORLD);
 
-    if (rank == ROOT) {
-      // Inserta las columnas recibidas en la matriz global
-      for (int process = 0; process < size; process++) {
-        for (int col = 0; col < C; col++) {
-          int col_global = col_offset + (process * C) + col;
-          for (int row = 0; row < N; row++) {
-            A_inv[row][col_global] =
-                recv_buffer[process * N * C + row * C + col];
-          }
-        }
-      }
-
-      free(recv_buffer);
-    }
-    // Actualiza la posicion de la columna
+    // Aumenta el offset para mover el puntero para los siguientes bloques
     col_offset += C * size;
   }
 
   // Impresion de la matriz inversa
   if (rank == ROOT) {
     printf("Matriz inversa:\n");
-    imprimir_matriz(A_inv, N, N);
+    imprimir_matriz(A, N, N);
     free_2d_double(&A);
-    free_2d_double(&A_inv);
   }
 
   free_2d_double(&local_A);
   free_2d_double(&local_A_inv);
 
-  MPI_Type_free(&block_type);
+  MPI_Type_free(&global_block);
   MPI_Type_free(&block);
-  MPI_Type_free(&column);
+  MPI_Type_free(&local_block);
 
   MPI_Finalize();
   return 0;
